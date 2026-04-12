@@ -40,7 +40,7 @@ class Config:
     # API Settings
     SEMANTIC_SCHOLAR_URL = "https://api.semanticscholar.org/graph/v1"
     TIMEOUT = 10
-    RATE_LIMIT = 1  # Seconds between API calls
+    RATE_LIMIT = 1  
     
     # Venue Rankings
     VENUE_RANKS = {
@@ -51,7 +51,7 @@ class Config:
         "BMVC": "B", "WACV": "B"
     }
     
-    # Storage
+    
     DB_PATH = "research_papers.db"
     FILTERS_PATH = "user_filters.json"
     REPORT_DIR = Path("reports")
