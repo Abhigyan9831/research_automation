@@ -8,6 +8,9 @@ Ready for KVM-1 VPS Deployment
 import requests
 import time
 import sqlite3
+import re
+import xml.etree.ElementTree as ET
+from urllib.parse import urlencode
 from typing import List, Dict, Optional, TypedDict, Annotated
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -39,8 +42,14 @@ class Config:
     
     # API Settings
     SEMANTIC_SCHOLAR_URL = "https://api.semanticscholar.org/graph/v1"
+    ARXIV_API_URL = "http://export.arxiv.org/api/query"
     TIMEOUT = 10
-    RATE_LIMIT = 1  
+    RATE_LIMIT = 1
+    # Extra Semantic Scholar query to surface IEEE, ACM, Springer, arXiv venue coverage (same API as primary fetch)
+    SUPPLEMENTARY_SS_SUFFIX = (
+        ' (venue:IEEE OR venue:ACM OR venue:Springer OR venue:arXiv OR venue:"IEEE Access")'
+    )
+    SUPPLEMENTARY_SS_LIMIT_CAP = 30
     
     # Venue Rankings
     VENUE_RANKS = {
@@ -48,7 +57,8 @@ class Config:
         "NeurIPS": "A*", "ICML": "A*", "ICLR": "A*",
         "AAAI": "A", "IJCAI": "A",
         "TPAMI": "Q1", "IJCV": "Q1", "TIP": "Q1",
-        "BMVC": "B", "WACV": "B"
+        "BMVC": "B", "WACV": "B",
+        "IEEE": "Q1", "ACM": "A", "Springer": "Q1", "arXiv": "Unranked",
     }
     
     
@@ -232,76 +242,179 @@ class ResearchState(TypedDict):
     timestamp: str
 
 # ================================
+# FETCH HELPERS (arXiv + Semantic Scholar; same paper shape as before)
+# ================================
+
+def _structure_ss_paper(paper: Dict) -> Dict:
+    """Map Semantic Scholar paper JSON to pipeline dict."""
+    authors = []
+    author_ids = []
+    for a in paper.get("authors", []):
+        authors.append(a.get("name", "Unknown"))
+        if a.get("authorId"):
+            author_ids.append(a["authorId"])
+    return {
+        "paper_id": paper.get("paperId"),
+        "title": paper.get("title", "Unknown"),
+        "authors": authors,
+        "author_ids": author_ids,
+        "venue": paper.get("venue"),
+        "year": paper.get("year"),
+        "publication_date": paper.get("publicationDate"),
+        "citations": paper.get("citationCount", 0),
+        "abstract": (paper.get("abstract") or "")[:500],
+        "author_details": [],
+        "venue_rank": "Unknown",
+        "is_new": True,
+    }
+
+
+def _dedupe_by_paper_id(papers: List[Dict]) -> List[Dict]:
+    seen = set()
+    out: List[Dict] = []
+    for p in papers:
+        pid = p.get("paper_id")
+        if pid:
+            if pid in seen:
+                continue
+            seen.add(pid)
+        out.append(p)
+    return out
+
+
+def _semantic_scholar_search(search_query: str, filters: Dict, limit: int) -> List[Dict]:
+    url = f"{Config.SEMANTIC_SCHOLAR_URL}/paper/search"
+    params = {
+        "query": search_query,
+        "limit": limit,
+        "fields": "paperId,title,authors,year,venue,citationCount,publicationDate,abstract",
+        "year": f"{filters.get('min_year', 2000)}-{filters.get('max_year', 2030)}"
+        if filters.get("min_year") or filters.get("max_year")
+        else None,
+    }
+    params = {k: v for k, v in params.items() if v is not None}
+    response = requests.get(url, params=params, timeout=Config.TIMEOUT)
+    response.raise_for_status()
+    raw_papers = response.json().get("data", [])
+    return [_structure_ss_paper(p) for p in raw_papers]
+
+
+def _parse_arxiv_atom(xml_text: str) -> List[Dict]:
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    root = ET.fromstring(xml_text)
+    out: List[Dict] = []
+    for entry in root.findall("atom:entry", ns):
+        id_el = entry.find("atom:id", ns)
+        title_el = entry.find("atom:title", ns)
+        published_el = entry.find("atom:published", ns)
+        summary_el = entry.find("atom:summary", ns)
+        if id_el is None or not id_el.text:
+            continue
+        id_url = id_el.text.strip()
+        m = re.search(r"arxiv\.org/abs/([^/?#]+)", id_url, re.I)
+        arxiv_id = m.group(1) if m else id_url.rsplit("/", 1)[-1]
+        title = (title_el.text or "").replace("\n", " ").strip() if title_el is not None else "Unknown"
+        published = (published_el.text or "")[:10] if published_el is not None else None
+        year = None
+        if published and len(published) >= 4:
+            try:
+                year = int(published[:4])
+            except ValueError:
+                pass
+        abstract = ""
+        if summary_el is not None and summary_el.text:
+            abstract = summary_el.text.replace("\n", " ").strip()[:500]
+        authors = []
+        for author in entry.findall("atom:author", ns):
+            name_el = author.find("atom:name", ns)
+            if name_el is not None and name_el.text:
+                authors.append(name_el.text.strip())
+        out.append(
+            {
+                "paper_id": f"arxiv:{arxiv_id}",
+                "title": title,
+                "authors": authors,
+                "author_ids": [],
+                "venue": "arXiv",
+                "year": year,
+                "publication_date": published,
+                "citations": 0,
+                "abstract": abstract,
+                "author_details": [],
+                "venue_rank": "Unknown",
+                "is_new": True,
+            }
+        )
+    return out
+
+
+def _fetch_arxiv_papers(query: str, max_results: int) -> List[Dict]:
+    if max_results <= 0:
+        return []
+    params = {
+        "search_query": f"all:{query}",
+        "start": 0,
+        "max_results": max_results,
+        "sortBy": "submittedDate",
+        "sortOrder": "descending",
+    }
+    url = f"{Config.ARXIV_API_URL}?{urlencode(params)}"
+    headers = {"User-Agent": "research-paper-automation/1.0"}
+    response = requests.get(url, headers=headers, timeout=Config.TIMEOUT)
+    response.raise_for_status()
+    return _parse_arxiv_atom(response.text)
+
+
+# ================================
 # AGENT NODES
 # ================================
 
 def fetch_papers_node(state: ResearchState) -> ResearchState:
     """
-    Agent 1: Fetch papers from Semantic Scholar
+    Agent 1: Fetch papers from Semantic Scholar (primary + IEEE/ACM/Springer/arXiv venue supplement) and arXiv API.
     """
-    logger.info("🔍 Agent 1: Fetching papers from Semantic Scholar...")
-    
+    logger.info(
+        "🔍 Agent 1: Fetching papers (Semantic Scholar, arXiv API, supplementary IEEE/ACM/Springer/arXiv venues)..."
+    )
+
     filters = state["filters"]
     query = filters.get("query", Config.BASE_QUERY)
-    
-    url = f"{Config.SEMANTIC_SCHOLAR_URL}/paper/search"
-    
-    # Build query with filters
+    max_limit = min(filters.get("max_results", 20) * 2, 100)
+
     search_query = query
-    
-    # Add venue filter to query if specified
     if filters.get("venues") and len(filters["venues"]) <= 3:
         venue_filter = " OR ".join([f'venue:"{v}"' for v in filters["venues"]])
         search_query = f"{query} ({venue_filter})"
-    
-    params = {
-        "query": search_query,
-        "limit": min(filters.get("max_results", 20) * 2, 100),  # Fetch extra for filtering
-        "fields": "paperId,title,authors,year,venue,citationCount,publicationDate,abstract",
-        "year": f"{filters.get('min_year', 2000)}-{filters.get('max_year', 2030)}" if filters.get("min_year") or filters.get("max_year") else None
-    }
-    
-    # Remove None values
-    params = {k: v for k, v in params.items() if v is not None}
-    
+
     try:
-        response = requests.get(url, params=params, timeout=Config.TIMEOUT)
-        response.raise_for_status()
-        
-        raw_papers = response.json().get("data", [])
-        
-        # Structure papers
-        structured = []
-        for paper in raw_papers:
-            authors = []
-            author_ids = []
-            
-            for a in paper.get("authors", []):
-                authors.append(a.get("name", "Unknown"))
-                if a.get("authorId"):
-                    author_ids.append(a["authorId"])
-            
-            structured.append({
-                "paper_id": paper.get("paperId"),
-                "title": paper.get("title", "Unknown"),
-                "authors": authors,
-                "author_ids": author_ids,
-                "venue": paper.get("venue"),
-                "year": paper.get("year"),
-                "publication_date": paper.get("publicationDate"),
-                "citations": paper.get("citationCount", 0),
-                "abstract": paper.get("abstract", "")[:500],  # Truncate abstract
-                "author_details": [],
-                "venue_rank": "Unknown",
-                "is_new": True
-            })
-        
-        logger.info(f"✅ Fetched {len(structured)} papers")
-        return {"papers": structured, "error": None}
-        
+        structured = _semantic_scholar_search(search_query, filters, max_limit)
+        logger.info(f"Semantic Scholar (primary): {len(structured)} papers")
     except Exception as e:
         logger.error(f"❌ Fetch failed: {e}")
         return {"papers": [], "error": str(e)}
+
+    time.sleep(Config.RATE_LIMIT)
+    try:
+        arxiv_max = min(max_limit // 2, 25)
+        arxiv_papers = _fetch_arxiv_papers(query, arxiv_max)
+        structured.extend(arxiv_papers)
+        logger.info(f"arXiv API: +{len(arxiv_papers)} papers")
+    except Exception as e:
+        logger.warning(f"arXiv fetch skipped: {e}")
+
+    time.sleep(Config.RATE_LIMIT)
+    try:
+        sup_query = f"{query}{Config.SUPPLEMENTARY_SS_SUFFIX}"
+        sup_limit = min(Config.SUPPLEMENTARY_SS_LIMIT_CAP, max_limit)
+        sup_papers = _semantic_scholar_search(sup_query, filters, sup_limit)
+        structured.extend(sup_papers)
+        logger.info(f"Semantic Scholar (IEEE/ACM/Springer/arXiv venues): +{len(sup_papers)} papers")
+    except Exception as e:
+        logger.warning(f"Supplementary Semantic Scholar fetch skipped: {e}")
+
+    structured = _dedupe_by_paper_id(structured)
+    logger.info(f"✅ Fetched {len(structured)} unique papers (merged)")
+    return {"papers": structured, "error": None}
 
 
 def filter_duplicates_node(state: ResearchState) -> ResearchState:
