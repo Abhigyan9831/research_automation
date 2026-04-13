@@ -8,15 +8,15 @@ Ready for KVM-1 VPS Deployment
 import requests
 import time
 import sqlite3
-import re
-import xml.etree.ElementTree as ET
-from urllib.parse import urlencode
 from typing import List, Dict, Optional, TypedDict, Annotated
 from datetime import datetime, timedelta
 from pathlib import Path
 import operator
 import smtplib
 import json
+import urllib.request
+import xml.etree.ElementTree as ET
+import hashlib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -40,16 +40,15 @@ class Config:
     BASE_QUERY = "computer vision"
     LIMIT = 20
     
+    # Source Selection
+    ENABLE_SEMANTIC_SCHOLAR = True
+    ENABLE_ARXIV = True  # Set to False to disable arXiv
+    
     # API Settings
     SEMANTIC_SCHOLAR_URL = "https://api.semanticscholar.org/graph/v1"
     ARXIV_API_URL = "http://export.arxiv.org/api/query"
     TIMEOUT = 10
-    RATE_LIMIT = 1
-    # Extra Semantic Scholar query to surface IEEE, ACM, Springer, arXiv venue coverage (same API as primary fetch)
-    SUPPLEMENTARY_SS_SUFFIX = (
-        ' (venue:IEEE OR venue:ACM OR venue:Springer OR venue:arXiv OR venue:"IEEE Access")'
-    )
-    SUPPLEMENTARY_SS_LIMIT_CAP = 30
+    RATE_LIMIT = 1  # Seconds between API calls
     
     # Venue Rankings
     VENUE_RANKS = {
@@ -57,11 +56,10 @@ class Config:
         "NeurIPS": "A*", "ICML": "A*", "ICLR": "A*",
         "AAAI": "A", "IJCAI": "A",
         "TPAMI": "Q1", "IJCV": "Q1", "TIP": "Q1",
-        "BMVC": "B", "WACV": "B",
-        "IEEE": "Q1", "ACM": "A", "Springer": "Q1", "arXiv": "Unranked",
+        "BMVC": "B", "WACV": "B"
     }
     
-    
+    # Storage
     DB_PATH = "research_papers.db"
     FILTERS_PATH = "user_filters.json"
     REPORT_DIR = Path("reports")
@@ -233,6 +231,8 @@ class UserFilters:
 class ResearchState(TypedDict):
     filters: Dict
     papers: Annotated[List[Dict], operator.add]
+    semantic_scholar_papers: List[Dict]  # From Semantic Scholar
+    arxiv_papers: List[Dict]  # From arXiv
     new_papers: List[Dict]
     filtered_papers: List[Dict]
     report_path: Optional[str]
@@ -242,188 +242,194 @@ class ResearchState(TypedDict):
     timestamp: str
 
 # ================================
-# FETCH HELPERS (arXiv + Semantic Scholar; same paper shape as before)
-# ================================
-
-def _structure_ss_paper(paper: Dict) -> Dict:
-    """Map Semantic Scholar paper JSON to pipeline dict."""
-    authors = []
-    author_ids = []
-    for a in paper.get("authors", []):
-        authors.append(a.get("name", "Unknown"))
-        if a.get("authorId"):
-            author_ids.append(a["authorId"])
-    return {
-        "paper_id": paper.get("paperId"),
-        "title": paper.get("title", "Unknown"),
-        "authors": authors,
-        "author_ids": author_ids,
-        "venue": paper.get("venue"),
-        "year": paper.get("year"),
-        "publication_date": paper.get("publicationDate"),
-        "citations": paper.get("citationCount", 0),
-        "abstract": (paper.get("abstract") or "")[:500],
-        "author_details": [],
-        "venue_rank": "Unknown",
-        "is_new": True,
-    }
-
-
-def _dedupe_by_paper_id(papers: List[Dict]) -> List[Dict]:
-    seen = set()
-    out: List[Dict] = []
-    for p in papers:
-        pid = p.get("paper_id")
-        if pid:
-            if pid in seen:
-                continue
-            seen.add(pid)
-        out.append(p)
-    return out
-
-
-def _semantic_scholar_search(search_query: str, filters: Dict, limit: int) -> List[Dict]:
-    url = f"{Config.SEMANTIC_SCHOLAR_URL}/paper/search"
-    params = {
-        "query": search_query,
-        "limit": limit,
-        "fields": "paperId,title,authors,year,venue,citationCount,publicationDate,abstract",
-        "year": f"{filters.get('min_year', 2000)}-{filters.get('max_year', 2030)}"
-        if filters.get("min_year") or filters.get("max_year")
-        else None,
-    }
-    params = {k: v for k, v in params.items() if v is not None}
-    response = requests.get(url, params=params, timeout=Config.TIMEOUT)
-    response.raise_for_status()
-    raw_papers = response.json().get("data", [])
-    return [_structure_ss_paper(p) for p in raw_papers]
-
-
-def _parse_arxiv_atom(xml_text: str) -> List[Dict]:
-    ns = {"atom": "http://www.w3.org/2005/Atom"}
-    root = ET.fromstring(xml_text)
-    out: List[Dict] = []
-    for entry in root.findall("atom:entry", ns):
-        id_el = entry.find("atom:id", ns)
-        title_el = entry.find("atom:title", ns)
-        published_el = entry.find("atom:published", ns)
-        summary_el = entry.find("atom:summary", ns)
-        if id_el is None or not id_el.text:
-            continue
-        id_url = id_el.text.strip()
-        m = re.search(r"arxiv\.org/abs/([^/?#]+)", id_url, re.I)
-        arxiv_id = m.group(1) if m else id_url.rsplit("/", 1)[-1]
-        title = (title_el.text or "").replace("\n", " ").strip() if title_el is not None else "Unknown"
-        published = (published_el.text or "")[:10] if published_el is not None else None
-        year = None
-        if published and len(published) >= 4:
-            try:
-                year = int(published[:4])
-            except ValueError:
-                pass
-        abstract = ""
-        if summary_el is not None and summary_el.text:
-            abstract = summary_el.text.replace("\n", " ").strip()[:500]
-        authors = []
-        for author in entry.findall("atom:author", ns):
-            name_el = author.find("atom:name", ns)
-            if name_el is not None and name_el.text:
-                authors.append(name_el.text.strip())
-        out.append(
-            {
-                "paper_id": f"arxiv:{arxiv_id}",
-                "title": title,
-                "authors": authors,
-                "author_ids": [],
-                "venue": "arXiv",
-                "year": year,
-                "publication_date": published,
-                "citations": 0,
-                "abstract": abstract,
-                "author_details": [],
-                "venue_rank": "Unknown",
-                "is_new": True,
-            }
-        )
-    return out
-
-
-def _fetch_arxiv_papers(query: str, max_results: int) -> List[Dict]:
-    if max_results <= 0:
-        return []
-    params = {
-        "search_query": f"all:{query}",
-        "start": 0,
-        "max_results": max_results,
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-    }
-    url = f"{Config.ARXIV_API_URL}?{urlencode(params)}"
-    headers = {"User-Agent": "research-paper-automation/1.0"}
-    response = requests.get(url, headers=headers, timeout=Config.TIMEOUT)
-    response.raise_for_status()
-    return _parse_arxiv_atom(response.text)
-
-
-# ================================
 # AGENT NODES
 # ================================
 
-def fetch_papers_node(state: ResearchState) -> ResearchState:
+def fetch_arxiv_papers_node(state: ResearchState) -> ResearchState:
     """
-    Agent 1: Fetch papers from Semantic Scholar (primary + IEEE/ACM/Springer/arXiv venue supplement) and arXiv API.
+    Agent 1a: Fetch papers from arXiv
     """
-    logger.info(
-        "🔍 Agent 1: Fetching papers (Semantic Scholar, arXiv API, supplementary IEEE/ACM/Springer/arXiv venues)..."
-    )
-
+    if not Config.ENABLE_ARXIV:
+        logger.info("⏭️  arXiv disabled")
+        return {"arxiv_papers": []}
+    
+    logger.info("📚 Agent 1a: Fetching papers from arXiv...")
+    
     filters = state["filters"]
     query = filters.get("query", Config.BASE_QUERY)
-    max_limit = min(filters.get("max_results", 20) * 2, 100)
+    
+    # arXiv search categories for computer vision
+    # cat:cs.CV = Computer Vision, cat:cs.AI = AI, cat:cs.LG = Machine Learning
+    search_query = f"all:{query}"
+    
+    # Add category filters based on query
+    if "computer vision" in query.lower() or "cv" in query.lower():
+        search_query = f"cat:cs.CV AND ({query})"
+    elif "machine learning" in query.lower() or "deep learning" in query.lower():
+        search_query = f"(cat:cs.LG OR cat:cs.CV) AND ({query})"
+    
+    # Build URL
+    url = f"{Config.ARXIV_API_URL}?search_query={urllib.parse.quote(search_query)}"
+    url += f"&max_results={Config.LIMIT}"
+    url += "&sortBy=submittedDate&sortOrder=descending"
+    
+    try:
+        with urllib.request.urlopen(url, timeout=Config.TIMEOUT) as response:
+            xml_data = response.read()
+        
+        # Parse XML
+        root = ET.fromstring(xml_data)
+        ns = {'atom': 'http://www.w3.org/2005/Atom', 'arxiv': 'http://arxiv.org/schemas/atom'}
+        
+        structured = []
+        
+        for entry in root.findall('atom:entry', ns):
+            # Extract data
+            title = entry.find('atom:title', ns).text.strip().replace('\n', ' ')
+            
+            # Authors
+            authors = [
+                author.find('atom:name', ns).text 
+                for author in entry.findall('atom:author', ns)
+            ]
+            
+            # arXiv ID
+            arxiv_id = entry.find('atom:id', ns).text.split('/abs/')[-1]
+            
+            # Published date
+            published = entry.find('atom:published', ns).text[:10]  # YYYY-MM-DD
+            
+            # Abstract
+            abstract = entry.find('atom:summary', ns).text.strip().replace('\n', ' ')
+            
+            # PDF link
+            pdf_link = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+            
+            # Categories
+            categories = [
+                cat.attrib['term'] 
+                for cat in entry.findall('atom:category', ns)
+            ]
+            primary_category = entry.find('arxiv:primary_category', ns)
+            primary_cat = primary_category.attrib['term'] if primary_category is not None else categories[0] if categories else "Unknown"
+            
+            # Create paper ID (hash of arXiv ID for consistency)
+            paper_id = f"arxiv_{arxiv_id.replace('.', '_')}"
+            
+            # Parse year from published date
+            year = int(published.split('-')[0]) if published else None
+            
+            structured.append({
+                "paper_id": paper_id,
+                "arxiv_id": arxiv_id,
+                "title": title,
+                "authors": authors,
+                "author_ids": [],  # arXiv doesn't provide author IDs
+                "venue": f"arXiv:{primary_cat}",
+                "year": year,
+                "publication_date": published,
+                "citations": 0,  # arXiv doesn't track citations
+                "abstract": abstract[:500],
+                "pdf_link": pdf_link,
+                "author_details": [],
+                "venue_rank": "Preprint",  # arXiv papers are preprints
+                "is_new": True,
+                "source": "arxiv"
+            })
+        
+        logger.info(f"✅ Fetched {len(structured)} papers from arXiv")
+        return {"arxiv_papers": structured, "papers": structured}
+        
+    except Exception as e:
+        logger.error(f"❌ arXiv fetch failed: {e}")
+        return {"arxiv_papers": [], "error": str(e)}
 
+
+def fetch_papers_node(state: ResearchState) -> ResearchState:
+    """
+    Agent 1b: Fetch papers from Semantic Scholar
+    """
+    if not Config.ENABLE_SEMANTIC_SCHOLAR:
+        logger.info("⏭️  Semantic Scholar disabled")
+        return {"semantic_scholar_papers": []}
+    
+    logger.info("🔍 Agent 1b: Fetching papers from Semantic Scholar...")
+    
+    filters = state["filters"]
+    query = filters.get("query", Config.BASE_QUERY)
+    
+    url = f"{Config.SEMANTIC_SCHOLAR_URL}/paper/search"
+    
+    # Build query with filters
     search_query = query
+    
+    # Add venue filter to query if specified
     if filters.get("venues") and len(filters["venues"]) <= 3:
         venue_filter = " OR ".join([f'venue:"{v}"' for v in filters["venues"]])
         search_query = f"{query} ({venue_filter})"
-
+    
+    params = {
+        "query": search_query,
+        "limit": min(filters.get("max_results", 20) * 2, 100),  # Fetch extra for filtering
+        "fields": "paperId,title,authors,year,venue,citationCount,publicationDate,abstract",
+        "year": f"{filters.get('min_year', 2000)}-{filters.get('max_year', 2030)}" if filters.get("min_year") or filters.get("max_year") else None
+    }
+    
+    # Remove None values
+    params = {k: v for k, v in params.items() if v is not None}
+    
     try:
-        structured = _semantic_scholar_search(search_query, filters, max_limit)
-        logger.info(f"Semantic Scholar (primary): {len(structured)} papers")
+        response = requests.get(url, params=params, timeout=Config.TIMEOUT)
+        response.raise_for_status()
+        
+        raw_papers = response.json().get("data", [])
+        
+        # Structure papers
+        structured = []
+        for paper in raw_papers:
+            authors = []
+            author_ids = []
+            
+            for a in paper.get("authors", []):
+                authors.append(a.get("name", "Unknown"))
+                if a.get("authorId"):
+                    author_ids.append(a["authorId"])
+            
+            structured.append({
+                "paper_id": paper.get("paperId"),
+                "title": paper.get("title", "Unknown"),
+                "authors": authors,
+                "author_ids": author_ids,
+                "venue": paper.get("venue"),
+                "year": paper.get("year"),
+                "publication_date": paper.get("publicationDate"),
+                "citations": paper.get("citationCount", 0),
+                "abstract": paper.get("abstract", "")[:500],  # Truncate abstract
+                "author_details": [],
+                "venue_rank": "Unknown",
+                "is_new": True
+            })
+        
+        logger.info(f"✅ Fetched {len(structured)} papers")
+        return {"semantic_scholar_papers": structured, "papers": structured, "error": None}
+        
     except Exception as e:
         logger.error(f"❌ Fetch failed: {e}")
-        return {"papers": [], "error": str(e)}
-
-    time.sleep(Config.RATE_LIMIT)
-    try:
-        arxiv_max = min(max_limit // 2, 25)
-        arxiv_papers = _fetch_arxiv_papers(query, arxiv_max)
-        structured.extend(arxiv_papers)
-        logger.info(f"arXiv API: +{len(arxiv_papers)} papers")
-    except Exception as e:
-        logger.warning(f"arXiv fetch skipped: {e}")
-
-    time.sleep(Config.RATE_LIMIT)
-    try:
-        sup_query = f"{query}{Config.SUPPLEMENTARY_SS_SUFFIX}"
-        sup_limit = min(Config.SUPPLEMENTARY_SS_LIMIT_CAP, max_limit)
-        sup_papers = _semantic_scholar_search(sup_query, filters, sup_limit)
-        structured.extend(sup_papers)
-        logger.info(f"Semantic Scholar (IEEE/ACM/Springer/arXiv venues): +{len(sup_papers)} papers")
-    except Exception as e:
-        logger.warning(f"Supplementary Semantic Scholar fetch skipped: {e}")
-
-    structured = _dedupe_by_paper_id(structured)
-    logger.info(f"✅ Fetched {len(structured)} unique papers (merged)")
-    return {"papers": structured, "error": None}
+        return {"semantic_scholar_papers": [], "error": str(e)}
 
 
 def filter_duplicates_node(state: ResearchState) -> ResearchState:
     """
-    Agent 2: Filter out papers already in database
+    Agent 2: Merge papers from both sources and filter duplicates
     """
-    logger.info("🔍 Agent 2: Filtering duplicate papers...")
+    logger.info("🔍 Agent 2: Merging sources and filtering duplicates...")
     
-    papers = state["papers"]
+    # Combine papers from both sources
+    all_papers = []
+    all_papers.extend(state.get("semantic_scholar_papers", []))
+    all_papers.extend(state.get("arxiv_papers", []))
+    
+    logger.info(f"Combined {len(all_papers)} papers from all sources")
     
     conn = sqlite3.connect(Config.DB_PATH)
     cursor = conn.cursor()
@@ -459,10 +465,10 @@ def filter_duplicates_node(state: ResearchState) -> ResearchState:
     conn.close()
     
     # Filter new papers
-    new_papers = [p for p in papers if p["paper_id"] not in existing_ids]
+    new_papers = [p for p in all_papers if p["paper_id"] not in existing_ids]
     
-    logger.info(f"✅ Found {len(new_papers)} new papers (out of {len(papers)} total)")
-    return {"new_papers": new_papers, "papers": papers}
+    logger.info(f"✅ Found {len(new_papers)} new papers (out of {len(all_papers)} total)")
+    return {"new_papers": new_papers, "papers": all_papers}
 
 
 def enrich_authors_node(state: ResearchState) -> ResearchState:
@@ -508,7 +514,7 @@ def enrich_authors_node(state: ResearchState) -> ResearchState:
             except Exception as e:
                 logger.warning(f"⚠️  Failed to enrich author {author_id}: {e}")
     
-    logger.info(f"✅ Enriched {enriched_count} author profiles")
+    logger.info(f"Enriched {enriched_count} author profiles")
     return {"new_papers": papers}
 
 
@@ -516,14 +522,14 @@ def apply_filters_node(state: ResearchState) -> ResearchState:
     """
     Agent 4: Apply user-defined filters
     """
-    logger.info("🔍 Agent 4: Applying user filters...")
+    logger.info("Agent 4: Applying user filters...")
     
     papers = state["new_papers"]
     filters = state["filters"]
     
     filtered = UserFilters.apply_to_papers(papers, filters)
     
-    logger.info(f"✅ {len(filtered)} papers passed filters (from {len(papers)})")
+    logger.info(f"{len(filtered)} papers passed filters (from {len(papers)})")
     
     # Calculate stats
     stats = {
@@ -540,11 +546,15 @@ def analyze_impact_node(state: ResearchState) -> ResearchState:
     """
     Agent 5: Analyze venue impact factors
     """
-    logger.info("📊 Agent 5: Analyzing venue impact...")
+    logger.info("Agent 5: Analyzing venue impact...")
     
     papers = state["filtered_papers"]
     
     for paper in papers:
+        # Skip if already marked as Preprint (arXiv)
+        if paper.get("venue_rank") == "Preprint":
+            continue
+        
         venue = paper.get("venue", "")
         rank = "Unranked"
         
@@ -557,7 +567,7 @@ def analyze_impact_node(state: ResearchState) -> ResearchState:
         
         paper["venue_rank"] = rank
     
-    logger.info("✅ Impact analysis complete")
+    logger.info("Impact analysis complete")
     return {"filtered_papers": papers}
 
 
@@ -565,7 +575,7 @@ def store_data_node(state: ResearchState) -> ResearchState:
     """
     Agent 6: Store papers in database
     """
-    logger.info("💾 Agent 6: Storing papers in database...")
+    logger.info("Agent 6: Storing papers in database...")
     
     papers = state["filtered_papers"]
     
@@ -620,7 +630,7 @@ def store_data_node(state: ResearchState) -> ResearchState:
     conn.commit()
     conn.close()
     
-    logger.info(f"✅ Stored {stored_count} papers")
+    logger.info(f"Stored {stored_count} papers")
     return {}
 
 
@@ -628,7 +638,7 @@ def generate_excel_node(state: ResearchState) -> ResearchState:
     """
     Agent 7: Generate Excel report
     """
-    logger.info("📊 Agent 7: Generating Excel report...")
+    logger.info("Agent 7: Generating Excel report...")
     
     papers = state["filtered_papers"]
     stats = state.get("stats", {})
@@ -732,11 +742,16 @@ def generate_excel_node(state: ResearchState) -> ResearchState:
         if len(paper.get("authors", [])) > 3:
             authors_str += " et al."
         
+        # Add arXiv link if available
+        venue_display = paper.get("venue", "N/A")
+        if paper.get("source") == "arxiv" and paper.get("arxiv_id"):
+            venue_display = f"arXiv ({paper['arxiv_id']})"
+        
         row = [
             i,
             paper["title"],
             authors_str,
-            paper.get("venue", "N/A"),
+            venue_display,
             paper["venue_rank"],
             paper.get("year", "N/A"),
             paper["citations"],
@@ -794,7 +809,7 @@ def generate_excel_node(state: ResearchState) -> ResearchState:
     # Save
     wb.save(report_path)
     
-    logger.info(f"✅ Report saved: {report_path}")
+    logger.info(f"Report saved: {report_path}")
     return {"report_path": str(report_path)}
 
 
@@ -802,7 +817,7 @@ def send_email_node(state: ResearchState) -> ResearchState:
     """
     Agent 8: Send email notification
     """
-    logger.info("📧 Agent 8: Sending email notification...")
+    logger.info("Agent 8: Sending email notification...")
     
     papers = state["filtered_papers"]
     report_path = state.get("report_path")
@@ -817,7 +832,7 @@ def send_email_node(state: ResearchState) -> ResearchState:
         msg = MIMEMultipart('alternative')
         msg['From'] = Config.EMAIL_FROM
         msg['To'] = ", ".join(Config.EMAIL_TO)
-        msg['Subject'] = f"📚 {len(papers)} New Research Papers - {datetime.now().strftime('%Y-%m-%d')}"
+        msg['Subject'] = f"{len(papers)} New Research Papers - {datetime.now().strftime('%Y-%m-%d')}"
         
         # Rank breakdown
         rank_counts = {}
@@ -849,7 +864,7 @@ def send_email_node(state: ResearchState) -> ResearchState:
         </head>
         <body>
             <div class="header">
-                <h2>🔬 Research Monitoring Report</h2>
+                <h2>Research Monitoring Report</h2>
                 <p>{datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
             </div>
             
@@ -883,19 +898,26 @@ def send_email_node(state: ResearchState) -> ResearchState:
                 "A*": "rank-as",
                 "Q1": "rank-q1",
                 "A": "rank-a",
-                "B": "rank-b"
+                "B": "rank-b",
+                "Preprint": "rank-b"
             }.get(rank, "")
             
             authors = ", ".join(paper.get("authors", [])[:3])
             if len(paper.get("authors", [])) > 3:
                 authors += " et al."
             
+            # Format venue with arXiv link
+            venue_display = paper.get('venue', 'N/A')
+            if paper.get("source") == "arxiv":
+                arxiv_link = f"https://arxiv.org/abs/{paper['arxiv_id']}"
+                venue_display = f'<a href="{arxiv_link}" style="color: #4472C4;">arXiv:{paper["arxiv_id"]}</a>'
+            
             html_body += f"""
             <div class="paper">
                 <h4>{i}. {paper['title']}</h4>
                 <p>
                     <strong>Authors:</strong> {authors}<br>
-                    <strong>Venue:</strong> {paper.get('venue', 'N/A')} 
+                    <strong>Venue:</strong> {venue_display} 
                     <span class="badge {rank_class}">{rank}</span><br>
                     <strong>Year:</strong> {paper.get('year', 'N/A')} | 
                     <strong>Citations:</strong> {paper['citations']}
@@ -955,11 +977,11 @@ def send_email_node(state: ResearchState) -> ResearchState:
         server.send_message(msg)
         server.quit()
         
-        logger.info(f"✅ Email sent to {len(Config.EMAIL_TO)} recipients")
+        logger.info(f"Email sent to {len(Config.EMAIL_TO)} recipients")
         return {"email_sent": True}
         
     except Exception as e:
-        logger.error(f"❌ Failed to send email: {e}")
+        logger.error(f"Failed to send email: {e}")
         return {"email_sent": False, "error": str(e)}
 
 
@@ -993,13 +1015,15 @@ def has_filtered_papers(state: ResearchState) -> str:
 # ================================
 def build_workflow():
     """
-    Multi-Agent Workflow with Advanced Filtering
+    Multi-Agent Workflow with arXiv + Semantic Scholar
     
     START
       ↓
-    Agent 1: Fetch Papers
+    Agent 1a: Fetch from arXiv
       ↓
-    Agent 2: Filter Duplicates → [none] → END
+    Agent 1b: Fetch from Semantic Scholar
+      ↓
+    Agent 2: Merge + Filter Duplicates → [none] → END
       ↓
     Agent 3: Enrich Authors (if needed)
       ↓
@@ -1018,7 +1042,8 @@ def build_workflow():
     workflow = StateGraph(ResearchState)
     
     # Add nodes
-    workflow.add_node("fetch", fetch_papers_node)
+    workflow.add_node("fetch_arxiv", fetch_arxiv_papers_node)
+    workflow.add_node("fetch_semantic", fetch_papers_node)
     workflow.add_node("filter_duplicates", filter_duplicates_node)
     workflow.add_node("enrich_authors", enrich_authors_node)
     workflow.add_node("apply_filters", apply_filters_node)
@@ -1028,10 +1053,11 @@ def build_workflow():
     workflow.add_node("email", send_email_node)
     
     # Define flow
-    workflow.set_entry_point("fetch")
+    workflow.set_entry_point("fetch_arxiv")
+    workflow.add_edge("fetch_arxiv", "fetch_semantic")
     
     workflow.add_conditional_edges(
-        "fetch",
+        "fetch_semantic",
         should_continue_after_fetch,
         {"continue": "filter_duplicates", "end": END, "error": END}
     )
@@ -1076,6 +1102,8 @@ class ResearchMonitor:
         initial_state = {
             "filters": filters,
             "papers": [],
+            "semantic_scholar_papers": [],
+            "arxiv_papers": [],
             "new_papers": [],
             "filtered_papers": [],
             "report_path": None,
@@ -1098,7 +1126,7 @@ class ResearchMonitor:
 def configure_filters_interactive():
     """Interactive CLI to configure filters"""
     print("\n" + "=" * 70)
-    print("🔧 CONFIGURE RESEARCH FILTERS")
+    print("CONFIGURE RESEARCH FILTERS")
     print("=" * 70)
     
     filters = UserFilters.load()
