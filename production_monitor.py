@@ -838,10 +838,12 @@ def send_email_node(state: ResearchState) -> ResearchState:
         return {"email_sent": False}
     
     try:
-        msg = MIMEMultipart('alternative')
-        msg['From'] = Config.EMAIL_FROM
-        msg['To'] = ", ".join(Config.EMAIL_TO)
-        msg['Subject'] = f"{len(papers)} New Research Papers - {datetime.now().strftime('%Y-%m-%d')}"
+        # Use mixed (not alternative) when attaching files: alternative + binary in one root
+        # confuses Gmail and can yield SMTP 503 "RCPT first" / protocol errors.
+        msg = MIMEMultipart("mixed")
+        msg["From"] = Config.EMAIL_FROM
+        msg["To"] = ", ".join(Config.EMAIL_TO)
+        msg["Subject"] = f"{len(papers)} New Research Papers - {datetime.now().strftime('%Y-%m-%d')}"
         
         # Rank breakdown
         rank_counts = {}
@@ -965,8 +967,8 @@ def send_email_node(state: ResearchState) -> ResearchState:
         </html>
         """
         
-        msg.attach(MIMEText(html_body, 'html'))
-        
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+
         # Attach Excel
         if report_path and Path(report_path).exists():
             with open(report_path, 'rb') as f:
@@ -979,12 +981,15 @@ def send_email_node(state: ResearchState) -> ResearchState:
                 )
                 msg.attach(part)
         
-        # Send
-        server = smtplib.SMTP(Config.SMTP_SERVER, Config.SMTP_PORT)
-        server.starttls()
-        server.login(Config.EMAIL_FROM, Config.EMAIL_PASSWORD)
-        server.send_message(msg)
-        server.quit()
+        # Send (explicit envelope matches Gmail expectations)
+        with smtplib.SMTP(Config.SMTP_SERVER, Config.SMTP_PORT) as server:
+            server.starttls()
+            server.login(Config.EMAIL_FROM, Config.EMAIL_PASSWORD)
+            server.sendmail(
+                Config.EMAIL_FROM,
+                list(Config.EMAIL_TO),
+                msg.as_string(),
+            )
         
         logger.info(f"Email sent to {len(Config.EMAIL_TO)} recipients")
         return {"email_sent": True}
