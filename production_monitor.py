@@ -234,6 +234,7 @@ class ResearchState(TypedDict):
     semantic_scholar_papers: List[Dict]  # From Semantic Scholar
     arxiv_papers: List[Dict]  # From arXiv
     new_papers: List[Dict]
+    dedupe_new_count: int  # papers whose IDs were not in DB (before fallback batch)
     filtered_papers: List[Dict]
     report_path: Optional[str]
     email_sent: bool
@@ -464,11 +465,19 @@ def filter_duplicates_node(state: ResearchState) -> ResearchState:
     existing_ids = {row[0] for row in cursor.fetchall()}
     conn.close()
     
-    # Filter new papers
+    # Filter new papers (deduplication unchanged)
     new_papers = [p for p in all_papers if p["paper_id"] not in existing_ids]
-    
-    logger.info(f"✅ Found {len(new_papers)} new papers (out of {len(all_papers)} total)")
-    return {"new_papers": new_papers, "papers": all_papers}
+    dedupe_new_count = len(new_papers)
+
+    # Fallback: no new IDs vs DB but we have a fetch batch — continue pipeline for report email
+    if not new_papers and all_papers:
+        new_papers = list(all_papers)
+        logger.info(
+            "No new paper IDs vs database; continuing with fetched papers for report pipeline (fallback)"
+        )
+
+    logger.info(f"✅ Found {dedupe_new_count} new papers (out of {len(all_papers)} total)")
+    return {"new_papers": new_papers, "papers": all_papers, "dedupe_new_count": dedupe_new_count}
 
 
 def enrich_authors_node(state: ResearchState) -> ResearchState:
@@ -531,10 +540,10 @@ def apply_filters_node(state: ResearchState) -> ResearchState:
     
     logger.info(f"{len(filtered)} papers passed filters (from {len(papers)})")
     
-    # Calculate stats
+    # Calculate stats (new_papers = count actually new vs DB, not fallback batch size)
     stats = {
         "total_fetched": len(state.get("papers", [])),
-        "new_papers": len(papers),
+        "new_papers": state.get("dedupe_new_count", len(papers)),
         "after_filters": len(filtered),
         "filtered_out": len(papers) - len(filtered)
     }
@@ -997,9 +1006,10 @@ def should_continue_after_fetch(state: ResearchState) -> str:
 
 
 def has_new_papers(state: ResearchState) -> str:
+    """Route after dedupe. Empty fetch → skip; otherwise process (dedupe node may fill fallback batch)."""
     if state.get("new_papers"):
         return "process"
-    logger.info("No new papers found")
+    logger.info("No papers to process (nothing fetched)")
     return "skip"
 
 
@@ -1105,6 +1115,7 @@ class ResearchMonitor:
             "semantic_scholar_papers": [],
             "arxiv_papers": [],
             "new_papers": [],
+            "dedupe_new_count": 0,
             "filtered_papers": [],
             "report_path": None,
             "email_sent": False,
