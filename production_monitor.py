@@ -12,15 +12,12 @@ from typing import List, Dict, Optional, TypedDict, Annotated
 from datetime import datetime, timedelta
 from pathlib import Path
 import operator
-import smtplib
+import base64
 import json
 import urllib.request
 import xml.etree.ElementTree as ET
 import hashlib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
+import resend
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -64,12 +61,10 @@ class Config:
     FILTERS_PATH = "user_filters.json"
     REPORT_DIR = Path("reports")
     
-    # Email Configuration
-    EMAIL_FROM = "your_email@gmail.com"
-    EMAIL_PASSWORD = "your_app_password"  # Gmail app password
+    # Email (Resend — verify domain and use API key from dashboard)
+    RESEND_API_KEY = "re_xxxxxxxx"
+    EMAIL_FROM = "Research Monitor <onboarding@resend.dev>"
     EMAIL_TO = ["recipient@email.com"]
-    SMTP_SERVER = "smtp.gmail.com"
-    SMTP_PORT = 587
     
     # Schedule
     RUN_HOUR = 9
@@ -838,13 +833,6 @@ def send_email_node(state: ResearchState) -> ResearchState:
         return {"email_sent": False}
     
     try:
-        # Use mixed (not alternative) when attaching files: alternative + binary in one root
-        # confuses Gmail and can yield SMTP 503 "RCPT first" / protocol errors.
-        msg = MIMEMultipart("mixed")
-        msg["From"] = Config.EMAIL_FROM
-        msg["To"] = ", ".join(Config.EMAIL_TO)
-        msg["Subject"] = f"{len(papers)} New Research Papers - {datetime.now().strftime('%Y-%m-%d')}"
-        
         # Rank breakdown
         rank_counts = {}
         for paper in papers:
@@ -967,29 +955,26 @@ def send_email_node(state: ResearchState) -> ResearchState:
         </html>
         """
         
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        subject = f"{len(papers)} New Research Papers - {datetime.now().strftime('%Y-%m-%d')}"
 
-        # Attach Excel
+        resend.api_key = Config.RESEND_API_KEY
+        params: Dict = {
+            "from": Config.EMAIL_FROM,
+            "to": list(Config.EMAIL_TO),
+            "subject": subject,
+            "html": html_body,
+        }
         if report_path and Path(report_path).exists():
-            with open(report_path, 'rb') as f:
-                part = MIMEBase('application', 'octet-stream')
-                part.set_payload(f.read())
-                encoders.encode_base64(part)
-                part.add_header(
-                    'Content-Disposition',
-                    f'attachment; filename={Path(report_path).name}'
-                )
-                msg.attach(part)
-        
-        # Send (explicit envelope matches Gmail expectations)
-        with smtplib.SMTP(Config.SMTP_SERVER, Config.SMTP_PORT) as server:
-            server.starttls()
-            server.login(Config.EMAIL_FROM, Config.EMAIL_PASSWORD)
-            server.sendmail(
-                Config.EMAIL_FROM,
-                list(Config.EMAIL_TO),
-                msg.as_string(),
-            )
+            with open(report_path, "rb") as f:
+                raw = f.read()
+            params["attachments"] = [
+                {
+                    "filename": Path(report_path).name,
+                    "content": base64.standard_b64encode(raw).decode("ascii"),
+                }
+            ]
+
+        resend.Emails.send(params)
         
         logger.info(f"Email sent to {len(Config.EMAIL_TO)} recipients")
         return {"email_sent": True}
