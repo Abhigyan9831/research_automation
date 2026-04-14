@@ -12,12 +12,10 @@ from typing import List, Dict, Optional, TypedDict, Annotated
 from datetime import datetime, timedelta
 from pathlib import Path
 import operator
-import base64
 import json
 import urllib.request
 import xml.etree.ElementTree as ET
 import hashlib
-import resend
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -61,10 +59,10 @@ class Config:
     FILTERS_PATH = "user_filters.json"
     REPORT_DIR = Path("reports")
     
-    # Email (Resend — verify domain and use API key from dashboard)
-    RESEND_API_KEY = "re_xxxxxxxx"
-    EMAIL_FROM = "Research Monitor <onboarding@resend.dev>"
-    EMAIL_TO = ["recipient@email.com"]
+    # Telegram Bot (create via @BotFather). Bots cannot send by phone number — only chat_id.
+    # Get chat_id: open the bot, send /start, then GET .../getUpdates and read message.chat.id
+    TELEGRAM_BOT_TOKEN = "000000000:XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    TELEGRAM_CHAT_ID = "000000000"
     
     # Schedule
     RUN_HOUR = 9
@@ -817,11 +815,21 @@ def generate_excel_node(state: ResearchState) -> ResearchState:
     return {"report_path": str(report_path)}
 
 
+def _telegram_send_document(data: bytes, filename: str, caption: Optional[str] = None) -> None:
+    url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendDocument"
+    files = {"document": (filename, data)}
+    form: Dict = {"chat_id": Config.TELEGRAM_CHAT_ID}
+    if caption:
+        form["caption"] = caption[:1024]
+    r = requests.post(url, data=form, files=files, timeout=max(Config.TIMEOUT, 120))
+    r.raise_for_status()
+
+
 def send_email_node(state: ResearchState) -> ResearchState:
     """
     Agent 8: Send email notification
     """
-    logger.info("Agent 8: Sending email notification...")
+    logger.info("Agent 8: Sending Telegram notification...")
     
     papers = state["filtered_papers"]
     report_path = state.get("report_path")
@@ -829,7 +837,7 @@ def send_email_node(state: ResearchState) -> ResearchState:
     filters = state["filters"]
     
     if not papers:
-        logger.info("No papers - skipping email")
+        logger.info("No papers - skipping notification")
         return {"email_sent": False}
     
     try:
@@ -957,30 +965,26 @@ def send_email_node(state: ResearchState) -> ResearchState:
         
         subject = f"{len(papers)} New Research Papers - {datetime.now().strftime('%Y-%m-%d')}"
 
-        resend.api_key = Config.RESEND_API_KEY
-        params: Dict = {
-            "from": Config.EMAIL_FROM,
-            "to": list(Config.EMAIL_TO),
-            "subject": subject,
-            "html": html_body,
-        }
+        html_name = f"research_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        _telegram_send_document(
+            html_body.encode("utf-8"),
+            html_name,
+            caption=subject,
+        )
         if report_path and Path(report_path).exists():
             with open(report_path, "rb") as f:
-                raw = f.read()
-            params["attachments"] = [
-                {
-                    "filename": Path(report_path).name,
-                    "content": base64.standard_b64encode(raw).decode("ascii"),
-                }
-            ]
+                xlsx_raw = f.read()
+            _telegram_send_document(
+                xlsx_raw,
+                Path(report_path).name,
+                caption="Excel report",
+            )
 
-        resend.Emails.send(params)
-        
-        logger.info(f"Email sent to {len(Config.EMAIL_TO)} recipients")
+        logger.info("Telegram notification sent")
         return {"email_sent": True}
         
     except Exception as e:
-        logger.error(f"Failed to send email: {e}")
+        logger.error(f"Failed to send Telegram notification: {e}")
         return {"email_sent": False, "error": str(e)}
 
 
