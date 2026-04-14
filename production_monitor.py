@@ -8,7 +8,7 @@ Ready for KVM-1 VPS Deployment
 import requests
 import time
 import sqlite3
-from typing import List, Dict, Optional, TypedDict, Annotated
+from typing import List, Dict, Optional, TypedDict, Annotated, Union
 from datetime import datetime, timedelta
 from pathlib import Path
 import operator
@@ -815,13 +815,30 @@ def generate_excel_node(state: ResearchState) -> ResearchState:
     return {"report_path": str(report_path)}
 
 
+def _telegram_chat_id_for_api(raw: str) -> Union[int, str]:
+    """Telegram accepts int for numeric chat ids; @channel for public channels."""
+    s = str(raw).strip()
+    if s.startswith("@"):
+        return s
+    try:
+        return int(s)
+    except ValueError:
+        return s
+
+
 def _telegram_send_document(data: bytes, filename: str, caption: Optional[str] = None) -> None:
     url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendDocument"
-    files = {"document": (filename, data)}
-    form: Dict = {"chat_id": Config.TELEGRAM_CHAT_ID}
+    chat_id = _telegram_chat_id_for_api(Config.TELEGRAM_CHAT_ID)
+    # Single multipart body: mixing data= + files= can yield 400 Bad Request from Telegram.
+    multipart: Dict[str, tuple] = {
+        "chat_id": (None, chat_id),
+        "document": (filename, data),
+    }
     if caption:
-        form["caption"] = caption[:1024]
-    r = requests.post(url, data=form, files=files, timeout=max(Config.TIMEOUT, 120))
+        multipart["caption"] = (None, caption[:1024])
+    r = requests.post(url, files=multipart, timeout=max(Config.TIMEOUT, 120))
+    if not r.ok:
+        logger.error("Telegram API response: %s", r.text)
     r.raise_for_status()
 
 
